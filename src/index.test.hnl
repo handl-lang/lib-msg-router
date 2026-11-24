@@ -1,0 +1,256 @@
+--- msg-router.test -- coverage for the envelope dispatcher
+--- (`src/index.hnl`): slash/dot type separators, type_key overrides,
+--- :param/*splat bindings (incl. splat remainder re-joined with sep),
+--- "*" catch-all, on_miss / raise miss paths, {out,state} handler
+--- normalization, middleware order, doc passthrough, describe/usage.
+
+from "./index" import * as mr
+from "str" import * as str
+
+-- ---------------------------------------------------------------------
+-- fixtures
+-- ---------------------------------------------------------------------
+
+h_msg   := (ctx) ~> "got " + ctx.req.type
+h_chan  := (ctx) ~> "chan=" + ctx.params.channel
+h_catch := (_ctx) ~> "caught"
+h_miss  := (env) ~> "miss:" + hash_map.get_or(env, "type", "<none>")
+
+-- ---------------------------------------------------------------------
+-- literal slash types + envelope intact on ctx.req
+-- ---------------------------------------------------------------------
+
+r1 := mr.router({
+  "message": h_msg,
+  "ping":    (ctx) ~> ctx.req.payload
+})
+
+test_literal_slash := assert r1({ type: "message", payload: 7 }) =
+  "got message"
+
+test_envelope_intact := assert r1({ type: "ping", payload: 42,
+  extra: { a: 1 } }) = 42
+
+-- ---------------------------------------------------------------------
+-- :param binding
+-- ---------------------------------------------------------------------
+
+r2 := mr.router({
+  "message/:channel": h_chan,
+  "user/:team/:id":   (ctx) ~> ctx.params.team + "/" + ctx.params.id
+})
+
+test_param_bind := assert r2({ type: "message/general" }) =
+  "chan=general"
+
+test_two_params := assert r2({ type: "user/core/42" }) = "core/42"
+
+test_param_arity_miss := assert match error.try(
+  (x) ~> r2({ type: "message" })) {
+  err(e): true, _: false }
+
+-- ---------------------------------------------------------------------
+-- "*" catch-all + specificity ranking
+-- ---------------------------------------------------------------------
+
+r3 := mr.router({
+  "*":               h_catch,
+  "message/:channel": h_chan,
+  "message.created": (ctx) ~> "created"
+})
+
+test_catchall := assert r3({ type: "anything/at/all" }) = "caught"
+
+test_literal_beats_param := assert r3({ type: "message.created" }) =
+  "created"
+
+test_param_beats_catchall := assert r3({ type: "message/x" }) =
+  "chan=x"
+
+-- ---------------------------------------------------------------------
+-- dot separator via opts.sep ("message.created" style)
+-- ---------------------------------------------------------------------
+
+r4 := mr.router({
+  "message.created":   (ctx) ~> "mc",
+  "user.joined.:team": (ctx) ~> "uj " + ctx.params.team
+}, { sep: "." })
+
+test_dot_literal := assert r4({ type: "message.created" }) = "mc"
+
+test_dot_param := assert r4({ type: "user.joined.eng" }) = "uj eng"
+
+-- deep dotted type = flat segment list (no subtree nesting in v1)
+test_dot_deep := assert mr.router({ "a.b.c": (_c) ~> "deep" },
+  { sep: "." })({ type: "a.b.c" }) = "deep"
+
+test_dot_extra_segment_misses := assert match error.try(
+  (x) ~> r4({ type: "message.created.extra" })) {
+  err(e): true, _: false }
+
+-- ---------------------------------------------------------------------
+-- *splat binding, incl. remainder re-joined with sep
+-- ---------------------------------------------------------------------
+
+r5 := mr.router({
+  "files/*rest": (ctx) ~> "rest=" + ctx.params.rest
+})
+
+test_splat_slash := assert r5({ type: "files/a/b/c" }) = "rest=a/b/c"
+
+test_splat_empty := assert r5({ type: "files" }) = "rest="
+
+r6 := mr.router({
+  "evt/*rest": (ctx) ~> "rest=" + ctx.params.rest
+}, { sep: "." })
+
+test_splat_dot_sep := assert r6({ type: "evt.a.b.c" }) = "rest=a.b.c"
+
+-- ---------------------------------------------------------------------
+-- type_key override ("kind" / "event")
+-- ---------------------------------------------------------------------
+
+rk := mr.router({ "kicked": (_c) ~> "k" }, { type_key: "kind" })
+re := mr.router({ "joined": (_c) ~> "j" }, { type_key: "event" })
+
+test_type_key_kind := assert rk({ kind: "kicked" }) = "k"
+
+test_type_key_event := assert re({ event: "joined" }) = "j"
+
+test_type_key_wrong_key_misses := assert match error.try(
+  (x) ~> rk({ type: "kicked" })) {
+  err(e): true, _: false }
+
+-- non-string type values stringify before dispatch
+rn := mr.router({ "1": (_c) ~> "num" })
+test_type_key_nonstring := assert rn({ type: 1 }) = "num"
+
+-- ---------------------------------------------------------------------
+-- miss paths: on_miss, missing type key, default raise
+-- ---------------------------------------------------------------------
+
+r7 := mr.router({ "known": (_c) ~> "k" }, { on_miss: h_miss })
+
+test_on_miss_unmatched := assert r7({ type: "nope" }) = "miss:nope"
+
+-- missing type_key -> miss path (never the "*" route)
+test_on_miss_missing_type := assert r7({ payload: 1 }) = "miss:<none>"
+
+-- missing type without on_miss -> raise
+r8 := mr.router({ "*": h_catch })
+test_missing_type_raises := assert match error.try(
+  (x) ~> r8({ payload: 1 })) {
+  err(e): true, _: false }
+
+-- unmatched without on_miss -> raise
+test_unmatched_raises := assert match error.try(
+  (x) ~> mr.router({ "a": (_c) ~> 1 })({ type: "b" })) {
+  err(e): true, _: false }
+
+-- empty-string type -> miss path too
+test_empty_type_raises := assert match error.try(
+  (x) ~> r8({ type: "" })) {
+  err(e): true, _: false }
+
+-- ---------------------------------------------------------------------
+-- spec-record leaves: { handler, doc?, name? } + doc passthrough
+-- ---------------------------------------------------------------------
+
+h_doc := (ctx) ~> do {
+  e := ctx.hit.entry
+  n := hash_map.get_or(e, "name", null)
+  hash_map.get_or(hash_map.get_or(e, "doc", {}), "summary", "?") +
+    "|" + (if n == null { "?" } else { n })
+}
+
+r9 := mr.router({
+  "evt/:id": { handler: h_doc, name: "on-evt",
+               doc: { summary: "an event" } }
+})
+
+test_spec_leaf_doc := assert r9({ type: "evt/9" }) =
+  "an event|on-evt"
+
+-- arrow leaf has null doc/name (no crash on access)
+h_probe := (ctx) ~> do {
+  e := ctx.hit.entry
+  (if e.doc == null { "nd" } else { "d" }) + "," +
+    (if e.name == null { "nn" } else { "n" })
+}
+r10 := mr.router({ "x": h_probe })
+test_arrow_leaf_doc_null := assert r10({ type: "x" }) = "nd,nn"
+
+-- ---------------------------------------------------------------------
+-- {out, state} handler normalization
+-- ---------------------------------------------------------------------
+
+r11 := mr.router({
+  "pair":  (ctx) ~> { out: "paired", state: { seen: ctx.params } },
+  "bare": (ctx) ~> "bare-out",
+  "rec":  (ctx) ~> { status: 200, body: "not-a-pair" }
+})
+
+test_pair_out := assert r11({ type: "pair" }) = "paired"
+
+test_bare_out := assert r11({ type: "bare" }) = "bare-out"
+
+test_plain_record_is_bare := assert match r11({ type: "rec" }) {
+  s: s.status == 200 && s.body == "not-a-pair", _: false }
+
+-- ---------------------------------------------------------------------
+-- middleware wrap order (outer first) + state threading
+-- ---------------------------------------------------------------------
+
+mr_state_get := (ctx, k) ~> hash_map.get_or(
+  hash_map.get_or(ctx, "state", {}), k, null)
+
+mr_state_put := (ctx, k, v) ~> hash_map.merge(ctx,
+  { state: hash_map.set(hash_map.get_or(ctx, "state", {}), k, v) })
+
+mw_a := (ctx, next) ~> do {
+  s0 := mr_state_get(ctx, "seq")
+  s  := if s0 == null { "" } else { s0 }
+  r  := next(mr_state_put(ctx, "seq", s + "A"))
+  { out: r.out, state: r.state }
+}
+
+mw_b := (ctx, next) ~> do {
+  s0 := mr_state_get(ctx, "seq")
+  s  := if s0 == null { "" } else { s0 }
+  r  := next(mr_state_put(ctx, "seq", s + "B"))
+  { out: r.out, state: r.state }
+}
+
+-- mw_a wraps mw_b wraps the terminal: seq accumulates "AB" on the way
+-- in, and the handler observes ctx.state.seq = "AB".
+probe_h := (ctx) ~> mr_state_get(ctx, "seq")
+
+r12 := mr.router({ "go": probe_h }, { middleware: [mw_a, mw_b] })
+
+test_middleware_order := assert r12({ type: "go" }) = "AB"
+
+-- middleware also wraps the miss path
+r13 := mr.router({ "go": (_c) ~> "ok" },
+  { middleware: [mw_a, mw_b], on_miss: h_miss })
+
+test_middleware_on_miss := assert match r13({ type: "nope" }) {
+  s: s == "miss:nope", _: false }
+
+-- ---------------------------------------------------------------------
+-- describe / usage
+-- ---------------------------------------------------------------------
+
+desc_routes := {
+  "message/:channel": { handler: h_chan, name: "on-msg",
+    doc: { summary: "new message" } },
+  "ping": h_msg
+}
+
+test_describe := assert match mr.describe(desc_routes) {
+  [a, b, ..._t]: a == "message/:channel (on-msg) -- new message" &&
+    b == "ping",
+  _: false }
+
+test_usage_alias := assert mr.usage(desc_routes) =
+  mr.describe(desc_routes)
+

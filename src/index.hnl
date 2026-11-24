@@ -1,0 +1,304 @@
+--- msg-router -- pure-handl message/event-envelope dispatcher over
+--- `lib-route` (P-008 / T-142).
+---
+--- Where `http-router` adapts lib-route to HTTP requests, this module
+--- adapts it to MESSAGE/ENVELOPE dispatch: chat events, webhook
+--- deliveries, queue messages, actor mailboxes -- anything shaped
+--- `{ type: "message.created", ...payload }` (or a user-chosen type
+--- key) that needs pattern routing with `:param`/`*splat` bindings.
+---
+--- `router(routes, opts?)` compiles a flat record of route patterns to
+--- handlers ONCE and returns `(envelope) ~> result`:
+---
+---   routes = {
+---     "message/:channel":        (ctx) ~> out,          -- arrow leaf
+---     "reaction/:emoji":         { handler: h,          -- spec leaf
+---                                  doc: { summary: "..." },
+---                                  name: "on-reaction" },
+---     "user.joined/:team":       h3,
+---     "*":                       catchall               -- splat catch-all
+---   }
+---
+--- Route keys are lib-route path patterns (literals, `:param`,
+--- `*name`/`*` splats, `(/optional)` groups, suffix vars) whose
+--- segments are split on `opts.sep` (default "/"). v1 is FLAT: msg
+--- types are dotted/slash-delimited strings, not nested subtrees --
+--- a key like "a.b.c" is three segments under `sep: "."`, and deeper
+--- nesting is expressed with more segments, not record nesting.
+---
+--- Envelope contract:
+---   - `opts.type_key` (default "type"; e.g. "kind", "event") names
+---     the record key holding the type string. Missing/empty -> the
+---     miss path (on_miss or raise), never the "*" route.
+---   - `opts.sep` (default "/") splits the type into tokens; "." gives
+---     "message.created"-style types. Route keys are translated
+---     sep -> "/" before compiling into the trie, and splat-bound
+---     param remainders are translated back (see `remap_params`).
+---   - On a hit the handler receives ONE ctx record:
+---       { req: <whole envelope>, state: <pipeline state>,
+---         params: { :name/*name bindings },
+---         hit: <dispatch candidate>, msg_type: <type string> }
+---     The whole envelope (payload + params) stays on `ctx.req`.
+---   - Handler results follow the cli-router convention: a record
+---     carrying `out` is used as the `{ out, state }` pair; anything
+---     else is normalized to `{ out: r, state: {} }`. The router
+---     arrow returns the final `out`.
+---
+--- Miss path (no candidate -- including when "*" is absent):
+---   `opts.on_miss` if provided is called as `on_miss(envelope) ~> out`
+---   (its result is normalized the same way); otherwise
+---   `error.raise("msg-router: no route for type '...'")`.
+---
+--- `opts.middleware` is an optional list of `(ctx, next) ~> { out,
+--- state }` middleware folded via `rt.pipeline` around the terminal
+--- dispatcher -- standard lib-route onion semantics, state via
+--- `rt.state_get`/`rt.state_put`.
+---
+--- `doc` on spec leaves is passthrough metadata: it survives
+--- `rt.compile` on `hit.entry.doc` (and `hit.entry.name`) for
+--- debugging and -- same role OpenAPI plays for http-router -- the
+--- future AsyncAPI spec consumer. `describe(routes)`/`usage(routes)`
+--- render `[String]` lines `"pattern (name) — summary"` for that.
+---
+--- Exports:
+---   router(routes, opts?)   ~> (envelope) ~> out
+---   describe(routes)        ~> [String]
+---   usage(routes)           ~> [String]   (alias of describe)
+
+from "str" import * as str
+from "route" import * as rt
+
+-- ---------------------------------------------------------------------
+-- small helpers (same idioms as lib-route / lib-http-router)
+-- ---------------------------------------------------------------------
+
+alen := (xs) ~> while { xs: xs, n: 0 } {
+  (xs, n) ~> match xs {
+    []: { out: n },
+    [_h, ...t]: { state: { xs: t, n: n + 1 } }
+  }
+}
+
+is_obj    := (v) ~> type.of(v) == "object"
+is_str    := (v) ~> type.of(v) == "string"
+is_arrow  := (v) ~> type.of(v) == "arrow"
+
+str_of := (v) ~> if is_str(v) {
+  v
+} else {
+  if type.of(v) == "number" { type.to_string(v) } else { "" }
+}
+
+--- first element of a `...rest` variadic tail, or null.
+rest0 := (rest) ~> match rest {
+  [h, ..._t]: h,
+  []: null
+}
+
+--- opts may be omitted, null, or a record; unknown/missing keys fall
+--- back to defaults.
+opt := (opts, k, dflt) ~> if is_obj(opts) {
+  hash_map.get_or(opts, k, dflt)
+} else {
+  dflt
+}
+
+-- ---------------------------------------------------------------------
+-- route-table -> lib-route entries
+-- ---------------------------------------------------------------------
+
+--- translate a route key's `sep` segments into the "/" segments the
+--- trie grammar understands. sep "/" is the identity.
+path_of := (key, sep) ~> if sep == "/" {
+  key
+} else {
+  str.replace(key, sep, "/")
+}
+
+--- normalize one leaf value to a trie entry, or null when the leaf is
+--- neither an arrow nor a `{ handler, ... }` spec record. Extra leaf
+--- fields (`doc`, `name`, and anything else on the spec record's
+--- entry) ride through `rt.compile` onto `hit.entry`.
+mk_entry := (key, leaf, sep) ~> do {
+  spec := is_obj(leaf) && hash_map.has(leaf, "handler")
+  if is_arrow(leaf) || spec {
+    { path: path_of(key, sep), route_key: key,
+      handler: if is_arrow(leaf) {
+        leaf
+      } else {
+        hash_map.get_or(leaf, "handler", null)
+      },
+      doc: if spec { hash_map.get_or(leaf, "doc", null) } else { null },
+      name: if spec { hash_map.get_or(leaf, "name", null) } else { null } }
+  } else {
+    -- tombstone: `path: null` makes rt.compile skip it (non-string
+    -- pattern), keeping the entry list a uniform record shape.
+    { path: null, route_key: key, handler: null, doc: null, name: null }
+  }
+}
+
+--- fold the routes record into an entry list (record key order).
+entries_of := (routes, sep) ~> while { ks: hash_map.keys(routes), out: [] } {
+  (ks, out) ~> match ks {
+    []: { out: out },
+    [k, ...t]: { state: { ks: t, out: [...out,
+      mk_entry(k, hash_map.get_or(routes, k, null), sep)] } }
+  }
+}
+
+-- ---------------------------------------------------------------------
+-- dispatch helpers
+-- ---------------------------------------------------------------------
+
+--- lib-route joins splat remainders with "/"; when `sep` differs we
+--- translate param values back so `*rest` on "a.b.c.d" binds "c.d",
+--- not "c/d". Single-token `:param` bindings never contain "/" in
+--- practice (tokens are split on `sep`), so a blanket remap is safe
+-- for well-formed types.
+remap_params := (params, sep) ~> if sep == "/" {
+  params
+} else {
+  while { ks: hash_map.keys(params), out: {} } {
+    (ks, out) ~> match ks {
+      []: { out: out },
+      [k, ...t]: do {
+        v := hash_map.get_or(params, k, null)
+        v2 := if is_str(v) { str.replace(v, "/", sep) } else { v }
+        { state: { ks: t, out: hash_map.set(out, k, v2) } }
+      }
+    }
+  }
+}
+
+--- cli-router result convention: a record carrying `out` is the
+--- `{ out, state }` pair (missing `state` -> {}); anything else is a
+--- bare output normalized to `{ out: r, state: {} }`.
+norm_pair := (r) ~> if is_obj(r) && hash_map.has(r, "out") {
+  { out: hash_map.get_or(r, "out", null),
+    state: hash_map.get_or(r, "state", {}) }
+} else {
+  { out: r, state: {} }
+}
+
+--- append every element of `bs` onto `a`, preserving order.
+cat_all := (a, b) ~> while { xs: b, out: a } {
+  (xs, out) ~> match xs {
+    []: { out: out },
+    [h, ...t]: { state: { xs: t, out: [...out, h] } }
+  }
+}
+
+-- ---------------------------------------------------------------------
+-- router
+-- ---------------------------------------------------------------------
+
+--- build a message dispatcher. `routes` is a flat record
+--- `{ type-pattern: handler | { handler, doc?, name? } }`; `opts`:
+---   type_key    -- envelope record key holding the type (default "type")
+---   sep         -- segment separator for types AND route keys
+---                  (default "/"; "." for "message.created" style)
+---   on_miss     -- (envelope) ~> out, called when no route hits
+---   middleware  -- [(ctx, next) ~> { out, state }] onion list
+--- Returns `(envelope) ~> out`.
+export router := (routes, ...rest) ~> do {
+  opts    := if alen(rest) == 0 { null } else { rest0(rest) }
+  type_key := opt(opts, "type_key", "type")
+  sep      := opt(opts, "sep", "/")
+  on_miss  := opt(opts, "on_miss", null)
+  mws      := opt(opts, "middleware", [])
+  mw_list  := if type.of(mws) == "array" { mws } else { [] }
+  trie     := rt.compile(entries_of(routes, sep))
+
+  --- miss path: on_miss(envelope) or raise. Returns a { out, state }
+  --- pair so it can sit in the pipeline terminal.
+  miss := (ctx) ~> do {
+    env := hash_map.get_or(ctx, "req", {})
+    key := str_of(hash_map.get_or(ctx, "msg_type", ""))
+    if on_miss != null {
+      norm_pair(on_miss(env))
+    } else {
+      error.raise("msg-router: no route for type '" + key + "'")
+    }
+  }
+
+  term := (ctx) ~> do {
+    hit := hash_map.get_or(ctx, "hit", null)
+    if hit == null {
+      miss(ctx)
+    } else {
+      h := hash_map.get_or(hit.entry, "handler", null)
+      if h == null {
+        miss(ctx)
+      } else {
+        norm_pair(h(ctx))
+      }
+    }
+  }
+
+  pipe := rt.pipeline(cat_all(mw_list, [term]))
+
+  (env) ~> do {
+    key0 := hash_map.get_or(env, type_key, "")
+    key  := if key0 == null { "" } else { str_of(key0) }
+    hit  := if str.is_empty(key) {
+      null
+    } else {
+      do {
+        d := rt.dispatch(trie, str.split(key, sep))
+        if d.hit == null {
+          null
+        } else {
+          hash_map.merge(d.hit,
+            { params: remap_params(d.hit.params, sep) })
+        }
+      }
+    }
+    r := pipe({ req: env, state: {}, hit: hit, msg_type: key,
+               params: if hit == null { {} } else { hit.params } })
+    r.out
+  }
+}
+
+-- ---------------------------------------------------------------------
+-- describe / usage: [String] listing of route patterns + docs
+-- ---------------------------------------------------------------------
+
+--- doc.summary when `doc` is a record, the doc itself when it is a
+--- bare string, else null.
+doc_summary := (doc) ~> if is_obj(doc) {
+  hash_map.get_or(doc, "summary", null)
+} else {
+  doc
+}
+
+--- render each route key as `"pattern (name) -- summary"` (parts
+--- omitted when absent), in record key order.
+export describe := (routes) ~> while { ks: hash_map.keys(routes), out: [] } {
+  (ks, out) ~> match ks {
+    []: { out: out },
+    [k, ...t]: do {
+      leaf := hash_map.get_or(routes, k, null)
+      name := if is_obj(leaf) {
+        hash_map.get_or(leaf, "name", null)
+      } else {
+        null
+      }
+      doc  := if is_obj(leaf) {
+        hash_map.get_or(leaf, "doc", null)
+      } else {
+        null
+      }
+      summ := doc_summary(doc)
+      s := k +
+        (if is_str(name) && str.is_empty(name) == false {
+          " (" + name + ")"
+        } else { "" }) +
+        (if is_str(summ) && str.is_empty(summ) == false {
+          " -- " + summ
+        } else { "" })
+      { state: { ks: t, out: [...out, s] } }
+    }
+  }
+}
+
+export usage := describe
